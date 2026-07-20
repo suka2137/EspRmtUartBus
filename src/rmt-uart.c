@@ -6,19 +6,6 @@
 
 #include "common.h"
 
-
-#ifndef RMT_UART_COMPENSATE_EDGE
-#define RMT_UART_COMPENSATE_EDGE 1
-#endif
-#ifndef RMT_UART_GLITCH_FILTER
-#define RMT_UART_GLITCH_FILTER 2
-#endif
-// #ifndef RMT_UART_NO_ENC_TABLE
-#define RMT_UART_NO_ENC_TABLE 1
-// #endif
-#ifndef RMT_UART_AFFINITY
-#define RMT_UART_AFFINITY CONFIG_ESP_MAIN_TASK_AFFINITY
-#endif
 #define DATA_ERR_IF(cond, err, msg)                                 \
     if(unlikely(cond)) {                                            \
         res.result = err;                                           \
@@ -26,35 +13,33 @@
         goto data_err;                                              \
     }
 
-#define ESP_LOCAL
+#define RU_BUS_MASTER_ADDR 0x00
 
-typedef struct RMT_UART_DECODER_JOB {
-    rmt_rx_done_event_data_t event;
-    rmt_uart_rx_t* rx;
-} rmt_uart_decoder_job_t;
-
+// typedef struct RMT_UART_DECODER_JOB {
+//     rmt_rx_done_event_data_t event;
+//     rmt_uart_rx_t* rx;
+// } rmt_uart_decoder_job_t;
 
 static const char* TAG = "RMT-UART";
 static const char* err_strs[] = {"success", "part", "malformed", "fault", "drop/recover", "deinit"};
 // static const char* state_strs[] = {"INACTIVE", "TX", "TX ONGOING", "RX", "RX ONGOING"};
 
-static bool swglitch = (RMT_UART_GLITCH_FILTER >= 2);
+static bool swglitch = (CONFIG_RU_FLT_MODE >= 2);
 static rmt_transmit_config_t TxConf = {.loop_count = 0, .flags.eot_level = 1};
 
 static rmt_uart_rx_t* rxs[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 static rmt_uart_tx_t* txs[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 
-// static rmt_uart_enc_lookup_t* tables[4] = {NULL, NULL, NULL, NULL};
-bool rmt_uart_ready = 0;
+
+bool ru_regular_uart_initialized;
 // static bool rmtUartHib = 0;
-static TaskHandle_t decoder_task = NULL;
-static QueueHandle_t dec_q = NULL;
+static TaskHandle_t decoder_task __attribute__((unused)) = NULL;
+static QueueHandle_t dec_q __attribute__((unused)) = NULL;
 
 static void dec_print_symbols(const rmt_rx_done_event_data_t* edata, rmt_uart_decoder_state_t* dec);
-static void rmt_uart_decoder_task(void* params);
-static void dec_task_start();
+// static void rmt_uart_decoder_task(void* params);
+// static void dec_task_start();
 IRAM_ATTR static bool byte_parity(uint8_t byte);
-
 
 IRAM_ATTR size_t rmt_uart_encoder(const void* data,
                                   size_t data_size,
@@ -67,13 +52,6 @@ IRAM_ATTR size_t rmt_uart_encoder(const void* data,
     size_t data_pos = tx->data_pos;
     uint8_t* data_bytes = (uint8_t*)data;
     size_t symbol_pos = 0;
-    if(data_pos >= data_size) {
-        rmt_symbol_word_t EndTx = {.level0 = 1, .duration0 = 0, .level1 = 1, .duration1 = 0};
-        symbols[0] = EndTx;
-        tx->data_pos = 0;
-        *done = 1;
-        return 1;
-    }
 
     uint16_t basePeriod = tx->basePeriod;
     uint8_t data_bits = tx->conf.data_bits;
@@ -83,28 +61,26 @@ IRAM_ATTR size_t rmt_uart_encoder(const void* data,
     uint8_t parity_index = stop_index - 1;
     uint8_t total_bits = stop_index + 1;
 
-    // rmt_uart_enc_lookup_t* table = tx->table;
-
-    while(symbols_free - symbol_pos >= total_bits / 2 && data_pos < data_size) {
-        uint8_t bv = data_bytes[data_pos];
-        uint8_t sum = 0;
-
-        bool mark_ninth = data_bits == 9 && data_pos == 0;
-
-        if(RMT_UART_NO_ENC_TABLE || unlikely(mark_ninth)) {
-            uint16_t bits = (bv << 1) | (1 << stop_index) | (mark_ninth << 9);
+    if(data_pos >= data_size) {
+        rmt_symbol_word_t EndTx = {.level0 = 1, .duration0 = 0, .level1 = 1, .duration1 = 0};
+        symbols[0] = EndTx;
+        tx->data_pos = 0;
+        *done = 1;
+        return 1;
+    }
+    bool mark_ninth = tx->address_field && symbols_written == 0;
+    if(unlikely(mark_ninth)) {
+        if(symbols_free - symbol_pos >= total_bits / 2) {
+            uint8_t bv = tx->tx_mpcm_target_addr;
+            uint16_t bits = (bv << 1) | (1 << stop_index) | (1 << 9);
             if(parity) {
                 bool p = (parity == RU_PARITY_MARK || parity == RU_PARITY_ODD);
-                if(parity == RU_PARITY_EVEN || parity == RU_PARITY_ODD) {
-                    p = byte_parity(bv);
-                    if(mark_ninth) p = !p;
-                }
+                if(parity == RU_PARITY_EVEN || parity == RU_PARITY_ODD) p = !byte_parity(bv);
                 bits |= (p << parity_index);
             }
 
             uint8_t rl = 1;
             uint8_t rl_last = 0;
-            sum = 0;
             for(uint16_t i = 0; i < total_bits; i++) {
                 if((bits & 0b1) == ((bits & 0b10) != 0)) rl++;
                 else {
@@ -115,7 +91,6 @@ IRAM_ATTR size_t rmt_uart_encoder(const void* data,
                             .level1 = 1,
                             .duration1 = rl * basePeriod,
                         };
-                        sum += rl_last + rl;
                         symbols[symbol_pos++] = s;
                         rl_last = 0;
                     } else rl_last = rl;
@@ -123,22 +98,43 @@ IRAM_ATTR size_t rmt_uart_encoder(const void* data,
                 }
                 bits >>= 1;
             }
-            assert(sum == total_bits);
-        } /*else {
-            rmt_uart_enc_item_t* i = &(table->parts[bv / 64][table->offs[bv]]);
-            do {
-                rmt_symbol_word_t s = {
-                    .level0 = 0,
-                    .duration0 = i->length0 * basePeriod,
-                    .level1 = 1,
-                    .duration1 = i->length1 * basePeriod,
-                };
-                sum += i->length0 + i->length1;
-                symbols[symbol_pos++] = s;
-                i++;
+
+            if(stops != RU_STOPS_1) {
+                uint16_t x = (stops == RU_STOPS_2) ? basePeriod : (basePeriod / 2);
+                symbols[symbol_pos - 1].duration1 += x;
             }
-            while(sum < total_bits);
-        }*/
+        } else return 0;
+    }
+
+    while(symbols_free - symbol_pos >= total_bits / 2 && data_pos < data_size) {
+        uint8_t bv = data_bytes[data_pos];
+
+        uint16_t bits = (bv << 1) | (1 << stop_index);
+        if(parity) {
+            bool p = (parity == RU_PARITY_MARK || parity == RU_PARITY_ODD);
+            if(parity == RU_PARITY_EVEN || parity == RU_PARITY_ODD) p = byte_parity(bv);
+            bits |= (p << parity_index);
+        }
+
+        uint8_t rl = 1;
+        uint8_t rl_last = 0;
+        for(uint16_t i = 0; i < total_bits; i++) {
+            if((bits & 0b1) == ((bits & 0b10) != 0)) rl++;
+            else {
+                if(rl_last) {
+                    rmt_symbol_word_t s = {
+                        .level0 = 0,
+                        .duration0 = rl_last * basePeriod,
+                        .level1 = 1,
+                        .duration1 = rl * basePeriod,
+                    };
+                    symbols[symbol_pos++] = s;
+                    rl_last = 0;
+                } else rl_last = rl;
+                rl = 1;
+            }
+            bits >>= 1;
+        }
 
         if(stops != RU_STOPS_1) {
             uint16_t x = (stops == RU_STOPS_2) ? basePeriod : (basePeriod / 2);
@@ -150,21 +146,21 @@ IRAM_ATTR size_t rmt_uart_encoder(const void* data,
     return symbol_pos;
 }
 
-IRAM_ATTR static bool rmt_uart_recv_cb_dt(rmt_channel_handle_t channel,
-                                          const rmt_rx_done_event_data_t* edata,
-                                          void* user_data) {
-    rmt_uart_rx_t* rx = (rmt_uart_rx_t*)user_data;
-    assert(rx != NULL && edata != NULL);
-    if(unlikely(rx->active == 0 || rx->rmtCh == NULL)) return false;
-    rmt_uart_decoder_job_t dj = {
-        .event = *edata,
-        .rx = rx,
-    };
-
-    BaseType_t high_task_wakeup = pdFALSE;
-    xQueueSendFromISR(dec_q, &dj, &high_task_wakeup);
-    return high_task_wakeup == pdTRUE;
-}
+// IRAM_ATTR static bool rmt_uart_recv_cb_dt(rmt_channel_handle_t channel,
+//                                           const rmt_rx_done_event_data_t* edata,
+//                                           void* user_data) {
+//     rmt_uart_rx_t* rx = (rmt_uart_rx_t*)user_data;
+//     assert(rx != NULL && edata != NULL);
+//     if(unlikely(rx->active == 0 || rx->rmtCh == NULL)) return false;
+//     rmt_uart_decoder_job_t dj = {
+//         .event = *edata,
+//         .rx = rx,
+//     };
+//
+//     BaseType_t high_task_wakeup = pdFALSE;
+//     xQueueSendFromISR(dec_q, &dj, &high_task_wakeup);
+//     return high_task_wakeup == pdTRUE;
+// }
 
 IRAM_ATTR bool rmt_uart_recv_cb_decode(rmt_channel_handle_t channel,
                                        const rmt_rx_done_event_data_t* edata,
@@ -172,7 +168,7 @@ IRAM_ATTR bool rmt_uart_recv_cb_decode(rmt_channel_handle_t channel,
     BaseType_t high_wakeup = false;
     rmt_uart_rx_t* rx = (rmt_uart_rx_t*)user_data;
     assert(rx != NULL);
-    if(unlikely(/*rx->active == 0 ||*/ rx->rmtCh == NULL)) return false;
+    if(unlikely(rx->rmtCh == NULL)) return false;
     QueueHandle_t notify_q = rx->recv_notify_queue;
     rmt_symbol_word_t* symbols = edata->received_symbols;
     assert(symbols != NULL);
@@ -210,7 +206,7 @@ IRAM_ATTR bool rmt_uart_recv_cb_decode(rmt_channel_handle_t channel,
     uint32_t val_mask = (0xFFFFFFFF >> (32 - data_bits)) & 0xFF;  // after 1 right shift
 
     uint16_t rl, rd = 0;
-    uint16_t r = (RMT_UART_COMPENSATE_EDGE) ? (decoder_state->minDuration / 5) : 0;
+    uint16_t r = (CONFIG_RU_SLOW_EDGE) ? (decoder_state->minDuration / 5) : 0;
     //  dec_print_symbols(edata, decoder_state);
     for(rmt_symbol_word_t* s = symbols; s < symbols + edata->num_symbols; s++) {
         DATA_ERR_IF(s->duration0 == 0, RU_RECV_MALFORMED, "EOF 0");
@@ -327,7 +323,7 @@ IRAM_ATTR static bool rmt_uart_tx_txDone_callback(rmt_channel_handle_t tx_chan,
                                                   const rmt_tx_done_event_data_t* edata,
                                                   void* user_data) {
     rmt_uart_tx_t* tx = (rmt_uart_tx_t*)user_data;
-    assert(tx != NULL && edata != NULL);
+    assert(tx != NULL);
     if(unlikely(tx->rmtCh == NULL)) return false;
 
     tx->active = 0;
@@ -340,13 +336,16 @@ IRAM_ATTR static bool rmt_uart_tx_txDone_callback(rmt_channel_handle_t tx_chan,
     return high_task_wakeup == pdTRUE;
 }
 
-
 esp_err_t RU_init_tx(rmt_uart_id new_id, rmt_uart_spec_t* conf, uint8_t notify_index) {
-    if(!rmt_uart_ready) RMT_UART_begin();
-    if(txs[new_id] != NULL) {
-        ESP_LOGE(TAG, "%d: Already initialized", new_id);
-        return -1;
-    }
+    ESP_RETURN_ON_FALSE(new_id >= 0 && new_id < 8, ESP_ERR_INVALID_ARG, TAG, "id out of range");
+    ESP_RETURN_ON_FALSE(
+        txs[new_id] == NULL, ESP_ERR_INVALID_STATE, TAG, "%d: already initialized", new_id);
+    ESP_RETURN_ON_FALSE(conf != NULL, ESP_ERR_INVALID_ARG, TAG, "conf NULL");
+    ESP_RETURN_ON_FALSE(
+        conf->data_bits >= 4 && conf->data_bits <= 9, ESP_ERR_INVALID_ARG, TAG, "data_bits");
+    ESP_RETURN_ON_FALSE(conf->rate != 0 && conf->rate <= 3200000, ESP_ERR_INVALID_ARG, TAG, "rate");
+    if(!ru_regular_uart_initialized) RMT_UART_begin();
+
     ESP_LOGD(TAG,
              "Creating %" PRIu32 " %d%c%d RMT UART TX on GPIO %" PRIu32 "",
              conf->rate,
@@ -354,21 +353,15 @@ esp_err_t RU_init_tx(rmt_uart_id new_id, rmt_uart_spec_t* conf, uint8_t notify_i
              rmt_uart_p_ch[conf->parity],
              conf->stop_bits,
              conf->gpio);
+
     txs[new_id] = malloc(sizeof(rmt_uart_tx_t));
+    ESP_RETURN_ON_FALSE(txs[new_id] != NULL, ESP_ERR_NO_MEM, TAG, "malloc");
     rmt_uart_tx_t* tx = txs[new_id];
-    rmt_uart_tx_t empty = {0};
-    *tx = empty;
+    *tx = (rmt_uart_tx_t){0};
     tx->conf = *conf;
     tx->selfId = new_id;
     tx->notifyIndex = notify_index;
-
-    // if(RMT_UART_NO_ENC_TABLE == 0) {
-    //     tx->table = rmt_uart_gen_enc_table(conf);
-    //     if(tx->table == NULL) {
-    //         ESP_LOGE(TAG, "Gen table failed");
-    //         return -1;
-    //     }
-    // }
+    tx->address_field = false;
 
     struct freq_selection freqs = rmt_uart_choose_freq(conf);
     rmt_tx_channel_config_t tx_chan_config = {
@@ -378,14 +371,13 @@ esp_err_t RU_init_tx(rmt_uart_id new_id, rmt_uart_spec_t* conf, uint8_t notify_i
         .resolution_hz = freqs.rmt_resolution_hz,
         .trans_queue_depth = 1,
         .flags.invert_out = false,
-    //.flags.io_loop_back = 0, TODO
-    //.flags.io_od_mode = 0,
 #if !SOC_RMT_SUPPORT_DMA
         .flags.with_dma = 0,
 #else
         .flags.with_dma = (new_id == 0),
 #endif
-        .flags.allow_pd = 0,
+        .flags.allow_pd = false,
+        .flags.init_level = 1,
     };
     tx->TxChConf = tx_chan_config;
     tx->basePeriod = freqs.basePeriod;
@@ -395,57 +387,72 @@ esp_err_t RU_init_tx(rmt_uart_id new_id, rmt_uart_spec_t* conf, uint8_t notify_i
         .arg = tx,
         .min_chunk_size = total_bits_enc / 2,
     };
-    ESP_ERROR_CHECK(rmt_new_simple_encoder(&simple_encoder_cfg, &tx->TxEncoder));
+
+    esp_err_t ret;
+    ESP_GOTO_ON_ERROR(
+        rmt_new_simple_encoder(&simple_encoder_cfg, &tx->TxEncoder), err_free, TAG, "new encoder");
+    ESP_GOTO_ON_ERROR(
+        rmt_new_tx_channel(&tx->TxChConf, &tx->rmtCh), err_enc, TAG, "new tx channel");
+    ESP_GOTO_ON_ERROR(rmt_enable(tx->rmtCh), err_chan, TAG, "enable tx");
 
     gpio_set_level(conf->gpio, 1);
     gpio_pullup_en(conf->gpio);
     gpio_hold_en(conf->gpio);
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx->TxChConf, &tx->rmtCh));
-    ESP_ERROR_CHECK(rmt_enable(tx->rmtCh));
 
-    rmt_encoder_handle_t CopyEncoder;
-    rmt_copy_encoder_config_t copy_encoder_config = {};
-    ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_encoder_config, &CopyEncoder));
+    rmt_encoder_handle_t copy_encoder;
+    rmt_copy_encoder_config_t copy_cfg = {};
+    ESP_GOTO_ON_ERROR(
+        rmt_new_copy_encoder(&copy_cfg, &copy_encoder), err_chan, TAG, "new copy encoder");
     rmt_symbol_word_t begin_high = {.level0 = 1, .duration0 = 8, .level1 = 1, .duration1 = 0};
-    rmt_transmit(tx->rmtCh, CopyEncoder, &begin_high, sizeof(begin_high), &TxConf);
+    rmt_transmit(tx->rmtCh, copy_encoder, &begin_high, sizeof(begin_high), &TxConf);
     rmt_tx_wait_all_done(tx->rmtCh, -1);
-    rmt_del_encoder(CopyEncoder);
+    rmt_del_encoder(copy_encoder);
     gpio_hold_dis(tx->conf.gpio);
 
     rmt_tx_event_callbacks_t cbs = {.on_trans_done = rmt_uart_tx_txDone_callback};
-    rmt_tx_register_event_callbacks(tx->rmtCh, &cbs, tx);
+    ESP_GOTO_ON_ERROR(
+        rmt_tx_register_event_callbacks(tx->rmtCh, &cbs, tx), err_chan, TAG, "register cb");
     tx->active = 0;
     ESP_LOGD(TAG, "%d Initialized tx", new_id);
     return ESP_OK;
+
+err_chan:
+    rmt_disable(tx->rmtCh);
+    rmt_del_channel(tx->rmtCh);
+err_enc:
+    rmt_del_encoder(tx->TxEncoder);
+err_free:
+    free(tx);
+    txs[new_id] = NULL;
+    return ret;
 }
 
 esp_err_t RU_transmit(rmt_uart_id id, uint8_t* payload, size_t size, TaskHandle_t xTaskToNotify) {
+    ESP_RETURN_ON_FALSE(id >= 0 && id < 8 && txs[id] != NULL, ESP_ERR_INVALID_ARG, TAG, "bad id");
+    ESP_RETURN_ON_FALSE(!RU_tx_get_ongoing(id), ESP_ERR_INVALID_STATE, TAG, "%d: ongoing", id);
     rmt_uart_tx_t* tx = txs[id];
-    assert(tx != NULL);
-    if(RU_tx_get_ongoing(id)) {
-        ESP_LOGE(TAG, "%d: ongoing", id);
-        return -1;
-    }
     ESP_LOGD(TAG, "%d: tx", id);
     tx->notifyOnTxDone = xTaskToNotify;
     tx->active = 1;
-
     ESP_ERROR_CHECK(rmt_transmit(tx->rmtCh, tx->TxEncoder, payload, size, &TxConf));
-    return 0;
+    return ESP_OK;
 }
 
 QueueHandle_t RU_init_rx(rmt_uart_id new_id, rmt_uart_spec_t* conf, int defer, bool continuous) {
-    if(!rmt_uart_ready) RMT_UART_begin();
-    if(rxs[new_id] != NULL) {
-        ESP_LOGE(TAG, "%d: Already initialized", new_id);
-        return NULL;
-    }
+    ESP_RETURN_ON_FALSE(new_id >= 0 && new_id < 8, NULL, TAG, "id out of range");
+    ESP_RETURN_ON_FALSE(rxs[new_id] == NULL, NULL, TAG, "%d: already initialized", new_id);
+    ESP_RETURN_ON_FALSE(conf != NULL, NULL, TAG, "conf NULL");
+    ESP_RETURN_ON_FALSE(conf->data_bits >= 4 && conf->data_bits <= 9, NULL, TAG, "data_bits");
+    ESP_RETURN_ON_FALSE(conf->rate != 0 && conf->rate <= 3200000, NULL, TAG, "rate");
 #ifdef CONFIG_IDF_TARGET_ESP32
     if(defer == -1) {
         ESP_LOGE(TAG, "%d: -1 not supported", new_id);
         return NULL;
     }
 #endif
+    ESP_RETURN_ON_FALSE(defer <= 0, NULL, TAG, "%d: task decoding (defer>0) not supported", new_id);
+    if(!ru_regular_uart_initialized) RMT_UART_begin();
+
     ESP_LOGD(TAG,
              "Creating %" PRIu32 " %d%c%d RMT UART RX on GPIO %" PRIu32 "",
              conf->rate,
@@ -454,17 +461,16 @@ QueueHandle_t RU_init_rx(rmt_uart_id new_id, rmt_uart_spec_t* conf, int defer, b
              conf->stop_bits,
              conf->gpio);
     rxs[new_id] = malloc(sizeof(rmt_uart_rx_t));
+    ESP_RETURN_ON_FALSE(rxs[new_id] != NULL, NULL, TAG, "malloc");
     rmt_uart_rx_t* rx = rxs[new_id];
-    rmt_uart_rx_t empty = {0};
-    *rx = empty;
+    *rx = (rmt_uart_rx_t){0};
     rx->conf = *conf;
     rx->selfId = new_id;
     rx->reenable_rx = continuous;
     rx->defer = defer;
 
     int mem_blocks = 1;
-    if(defer <= 0) rx->rx_buf_bytes = mem_blocks * 256;
-    else rx->rx_buf_bytes = defer;
+    rx->rx_buf_bytes = mem_blocks * 256;
     rx->recv_symbol_buffer = malloc(rx->rx_buf_bytes);
 
     struct freq_selection freqs = rmt_uart_choose_freq(conf);
@@ -479,7 +485,7 @@ QueueHandle_t RU_init_rx(rmt_uart_id new_id, rmt_uart_spec_t* conf, int defer, b
 #else
         .flags.with_dma = (new_id == 0),
 #endif
-        .flags.allow_pd = 0,
+        .flags.allow_pd = false,
     };
     rmt_receive_config_t RxConf = {
         .signal_range_max_ns = freqs.idle_range_ns,
@@ -487,35 +493,29 @@ QueueHandle_t RU_init_rx(rmt_uart_id new_id, rmt_uart_spec_t* conf, int defer, b
 #ifdef CONFIG_IDF_TARGET_ESP32
         .flags.en_partial_rx = 0,
 #else
-        .flags.en_partial_rx = defer <= 0,
+        .flags.en_partial_rx = true,
 #endif
     };
     rx->RxChConf = rx_chan_config;
     rx->RxConf = RxConf;
 
-    rmt_uart_decoder_state_t ds = {0};
+    rmt_uart_decoder_state_t ds = {};
     ds.minDuration = freqs.decoder_min_duration;
     rx->decoder_state = ds;
     rx->recv_notify_queue = xQueueCreate(1, sizeof(rmt_uart_recv_notify_t));
 
-    if(defer > 0 && decoder_task == NULL) dec_task_start();
     ESP_ERROR_CHECK(rmt_new_rx_channel(&rx->RxChConf, &rx->rmtCh));
-    rmt_rx_event_callbacks_t cbs = {
-        .on_recv_done = (defer > 0) ? rmt_uart_recv_cb_dt : rmt_uart_recv_cb_decode,
-    };
-    rmt_rx_register_event_callbacks(rx->rmtCh, &cbs, rx);
+    rmt_rx_event_callbacks_t cbs = {.on_recv_done = rmt_uart_recv_cb_decode};
+    ESP_ERROR_CHECK(rmt_rx_register_event_callbacks(rx->rmtCh, &cbs, rx));
     ESP_ERROR_CHECK(rmt_enable(rx->rmtCh));
     rx->active = 0;
     return rx->recv_notify_queue;
 }
 
 QueueHandle_t RU_recv(rmt_uart_id id, uint8_t* buffer, size_t bufferSize) {
+    ESP_RETURN_ON_FALSE(id >= 0 && id < 8 && rxs[id] != NULL, NULL, TAG, "bad id");
     rmt_uart_rx_t* rx = rxs[id];
-    assert(rx != NULL);
-    if(RU_rx_get_ongoing(id)) {
-        ESP_LOGE(TAG, "%d: ongoing", id);
-        return NULL;
-    }
+    ESP_RETURN_ON_FALSE(!RU_rx_get_ongoing(id), NULL, TAG, "%d: ongoing", id);
     rx->decoder_state.outBuf = buffer;
     rx->decoder_state.outBufSize = bufferSize;
     rx->decoder_state.outBufPos = 0;
@@ -524,9 +524,37 @@ QueueHandle_t RU_recv(rmt_uart_id id, uint8_t* buffer, size_t bufferSize) {
     return rx->recv_notify_queue;
 }
 
+void RU_end_rx(rmt_uart_id id) {
+    if(!RU_rx_get_ongoing(id)) return;
+    rmt_uart_rx_t* rx = rxs[id];
+    ESP_ERROR_CHECK(rmt_disable(rx->rmtCh));
+    ESP_ERROR_CHECK(rmt_enable(rx->rmtCh));
+    rx->active = 0;
+}
+
+// void RU_disable_all();  // TODO
+// void RU_resume_all();   // TODO
+
+void RMT_UART_begin() {
+    ru_regular_uart_initialized = true;
+}
+
+void RMT_UART_end() {
+    for(int i = 0; i < 8; i++) ESP_ERROR_CHECK(RU_deinit(i, 0));
+    ru_regular_uart_initialized = false;
+}
+
+bool RU_tx_get_ongoing(const rmt_uart_id id) {
+    assert(id >= 0 && id < 8 && txs[id] != NULL);
+    return txs[id]->active;
+}
+bool RU_rx_get_ongoing(const rmt_uart_id id) {
+    assert(id >= 0 && id < 8 && rxs[id] != NULL);
+    return rxs[id]->active;
+}
 
 esp_err_t RU_deinit(rmt_uart_id id, bool wait) {
-    assert(id < 8);
+    assert(id >= 0 && id < 8);
     if(rxs[id] != NULL) {
         rmt_uart_rx_t* rx = rxs[id];
         if(RU_rx_get_ongoing(id)) {
@@ -573,72 +601,21 @@ esp_err_t RU_deinit(rmt_uart_id id, bool wait) {
     return ESP_OK;
 }
 
-void RU_end_rx(rmt_uart_id id) {
-    if(!RU_rx_get_ongoing(id)) return;
-    rmt_uart_rx_t* rx = rxs[id];
-    ESP_ERROR_CHECK(rmt_disable(rx->rmtCh));
-    ESP_ERROR_CHECK(rmt_enable(rx->rmtCh));
-    rx->active = 0;
-}
-
-
-// void RU_disable_all();  // TODO
-// void RU_resume_all();   // TODO
-
-
-void RMT_UART_begin() {
-    rmt_uart_ready = 1;
-    return;
-}
-
-void RMT_UART_end() {
-    for(int i = 0; i < 8; i++) ESP_ERROR_CHECK(RU_deinit(i, 0));
-    // for(int i = 0; i < (sizeof(tables) / sizeof(tables[0])); i++) {
-    //     if(tables[i] != NULL) {
-    //         for(int j = 0; j < 4; j++)
-    //             if(tables[i]->parts[j] != NULL) free(tables[i]->parts[j]);
-    //
-    //         free(tables[i]);
-    //         tables[i] = NULL;
-    //     }
-    // }
-    if(decoder_task != NULL) {
-        vTaskDelete(decoder_task);
-        decoder_task = NULL;
-    }
-    if(dec_q != NULL) {
-        vQueueDelete(dec_q);
-        dec_q = NULL;
-    }
-
-    rmt_uart_ready = 0;
-}
-
-
-bool RU_tx_get_ongoing(const rmt_uart_id id) {
-    assert(id < 8 && txs[id] != NULL);
-    return txs[id]->active;
-}
-bool RU_rx_get_ongoing(const rmt_uart_id id) {
-    assert(id < 8 && rxs[id] != NULL);
-    return rxs[id]->active;
-}
-
-static void rmt_uart_decoder_task(void* params) {
-    dec_q = xQueueCreate(8, sizeof(rmt_uart_decoder_job_t));
-    rmt_uart_decoder_job_t currentItem;
-    while(1) {
-        xQueueReceive(dec_q, &currentItem, portMAX_DELAY);
-        rmt_uart_recv_cb_decode(currentItem.rx->rmtCh, &currentItem.event, currentItem.rx);
-    }
-}
-static void dec_task_start() {
-    ESP_LOGD(TAG, "Starting decoder");
-    BaseType_t res = xTaskCreatePinnedToCore(
-        rmt_uart_decoder_task, "RU_DEC", 2000, NULL, 2, &decoder_task, RMT_UART_AFFINITY);
-    assert(res == pdPASS);
-    ESP_LOGD(TAG, "Started decoder task");
-}
+// static void rmt_uart_decoder_task(void* params) {
+//     dec_q = xQueueCreate(8, sizeof(rmt_uart_decoder_job_t));
+//     rmt_uart_decoder_job_t currentItem;
+//     while(1) {
+//         xQueueReceive(dec_q, &currentItem, portMAX_DELAY);
+//         rmt_uart_recv_cb_decode(currentItem.rx->rmtCh, &currentItem.event, currentItem.rx);
+//     }
+// }
+// static void dec_task_start() {
+//     ESP_LOGD(TAG, "Starting decoder");
+//     BaseType_t res = xTaskCreatePinnedToCore(
+//         rmt_uart_decoder_task, "RU_DEC", 2000, NULL, 2, &decoder_task, RMT_UART_AFFINITY);
+//     assert(res == pdPASS);
+//     ESP_LOGD(TAG, "Started decoder task");
+// }
 
 static bool byte_parity(uint8_t byte) {
     byte ^= byte >> 4;
@@ -679,10 +656,10 @@ struct freq_selection rmt_uart_choose_freq(rmt_uart_spec_t* conf) {
     // ESP32-S3 TRM: "the minimum value of pulse width should be larger than (3 × Tapb_clk + 5 ×
     // Trmt_sclk )."
 
-    bool hwglitch = (RMT_UART_GLITCH_FILTER == 1 || RMT_UART_GLITCH_FILTER == 3);
+    bool hwglitch = (CONFIG_RU_FLT_MODE == 1 || CONFIG_RU_FLT_MODE == 3);
     if(!hwglitch) minDuration_ns = 0;
     uint32_t decoder_min_duration =
-        (RMT_UART_COMPENSATE_EDGE) ? basePeriod : (basePeriod - (basePeriod / 25));
+        (CONFIG_RU_SLOW_EDGE) ? basePeriod : (basePeriod - (basePeriod / 25));
 
     assert(basePeriod >= 25);
     ESP_LOGD(TAG,
@@ -705,90 +682,7 @@ struct freq_selection rmt_uart_choose_freq(rmt_uart_spec_t* conf) {
     };
     return result;
 }
-// probably broken as of now
-// rmt_uart_enc_lookup_t* rmt_uart_gen_enc_table(const rmt_uart_spec_t* conf) {
-//     uint8_t data_bits = conf->data_bits;
-//     uint8_t parity = conf->parity;
-//     uint8_t stops = conf->stop_bits;
-//
-//     for(int i = 0; i < 4; i++)
-//         if(tables[i]) {
-//             if(tables[i]->data == data_bits && tables[i]->parity == parity &&
-//                tables[i]->stops == stops)
-//             {
-//                 return tables[i];
-//             }
-//         }
-//
-//     int id;
-//     for(id = 0; id < 4; id++)
-//         if(tables[id] == NULL) break;
-//     if(tables[id] != NULL) {
-//         ESP_LOGE(TAG, "No free table");
-//         return NULL;
-//     }
-//     tables[id] = malloc(sizeof(rmt_uart_enc_lookup_t));
-//     tables[id]->data = data_bits;
-//     tables[id]->stops = stops;
-//     tables[id]->parity = parity;
-//
-//     rmt_uart_enc_item_t* temp = malloc(sizeof(rmt_uart_enc_item_t) * 256);
-//     size_t size;
-//
-//     uint8_t parts = (data_bits >= 8) ? 4 : ((data_bits == 7) ? 2 : 1);
-//     uint8_t stop_index = data_bits + (parity != 0) + 1;
-//     uint8_t total_bits = stop_index + 1;
-//     for(uint16_t part = 0; part < 4; part++) {
-//         if(part >= parts) {
-//             tables[id]->parts[part] = NULL;
-//             continue;
-//         }
-//         size = 0;
-//         for(uint16_t c = part * 64; c < (part + 1) * 64; c++) {
-//             if(c >= (1 << data_bits)) break;  // 2^data_bits
-//             uint16_t bits = (c << 1) | (1 << stop_index);
-//             if(parity) {
-//                 uint8_t parity_index = stop_index - 1;
-//                 bool b = (parity == RU_PARITY_MARK || parity == RU_PARITY_ODD);
-//                 if(parity == RU_PARITY_EVEN || parity == RU_PARITY_ODD)
-//                     b ^= byte_parity((uint8_t)c);
-//                 bits |= (b << parity_index);
-//             }
-//
-//             uint8_t durations[12];
-//             uint16_t rl = 1;
-//             uint16_t sum = 0;
-//             uint16_t count = 0;
-//
-//             for(uint16_t i = 0; i < total_bits; i++) {
-//                 if((bits & 0b1) == ((bits & 0b10) != 0)) rl++;
-//                 else {
-//                     durations[count++] = rl;
-//                     sum += rl;
-//                     rl = 1;
-//                 }
-//                 bits >>= 1;
-//             }
-//             assert(sum == total_bits);
-//             assert(count % 2 == 0 && count <= total_bits);
-//
-//             tables[id]->offs[c] = size;
-//
-//             for(uint16_t i = 0; i < count / 2; i++) {
-//                 rmt_uart_enc_item_t entry = {
-//                     .length0 = durations[i * 2],
-//                     .length1 = durations[i * 2 + 1],
-//                 };
-//                 temp[size++] = entry;
-//             }
-//         }
-//         tables[id]->parts[part] = malloc(size);
-//         memcpy(tables[id]->parts[part], temp, size);
-//     }
-//
-//     free(temp);
-//     return tables[id];
-// }
+
 static void dec_print_symbols(const rmt_rx_done_event_data_t* edata,
                               rmt_uart_decoder_state_t* dec) {
     if(LOG_LOCAL_LEVEL < ESP_LOG_DEBUG) return;

@@ -7,18 +7,10 @@
 // Threading is not supported yet - use the API only from that core
 #define RMT_UART_AFFINITY CONFIG_ESP_MAIN_TASK_AFFINITY
 
-// Add a non-cumulative rounding value to each run length instead of loosening the basePeriod
-// This can work well when most of the error comes from edge transitions (on by default)
-#define RMT_UART_COMPENSATE_EDGE 1
-// 0: Disabled (debug)  1: Hardware  2: Software filtering (more aggressive, default)  3: Both
-#define RMT_UART_GLITCH_FILTER 2
-// Do not generate encoder lookup tables
-#define RMT_UART_NO_ENC_TABLE 1
-
 // TX and RX can have an id from 0 to 7, optionally the same one
 typedef int rmt_uart_id;
 
-typedef enum UB_RX_STAT {
+typedef enum {
     RU_RECV_SUCCESS,       // Empty queue indicates readiness to receive
     RU_RECV_PART,          // Sent if chunks are not accumulated.
     RU_RECV_MALFORMED,     // Failed to decode. Data integrity issues will also cause this
@@ -52,8 +44,10 @@ typedef struct RMT_UART_SPEC {
     uint32_t gpio;
     uint32_t rate;
 
-    // 4-9 data bits. Transmitting 9 will mark the 9th bit of the first byte.
-    // For < 8, only the LSBs are used (the rest must be 0s)
+    // 4-9 data bits, Always LSB first.
+    // The bus (RU_bus_*) forces 9-bit MPCM framing: bit 9 of the first byte
+    // (the address, from tx_mpcm_target_addr) is set to mark it; payload bytes
+    // carry bit 9 cleared. Requires data_bits == 9 when address_field is set.
     int data_bits;
 
     // use enum RU_STOPS_x: 1, 1_5, 2
@@ -66,21 +60,25 @@ typedef struct RMT_UART_SPEC {
 
 esp_err_t RU_init_tx(rmt_uart_id new_id, rmt_uart_spec_t* conf, uint8_t notify_index);
 
+/* Returns a 1-item queue of rmt_uart_recv_notify_t. Emptiness states being ready to receive.
+ * continuous: keep receiving. Use xQueuePeek() and CONFIG_RMT_RECV_FUNC_IN_IRAM .
+ * defer=-1: Partial recv in ISR, start pushing parts before completion (Not for ESP32).
+ * defer=0: Decoding in ISR with partial receiving if available.
+ * Other value: Symbol buffer size in bytes for decoding in a task (Not currently supported),
+ * 5 RMT words (20 bytes) per byte (8N1).
+ */
+QueueHandle_t RU_init_rx(rmt_uart_id new_id, rmt_uart_spec_t* conf, int defer, bool continuous);
+
+// void RU_get_mutex(rmt_uart_id id);
+// void RU_release_mutex(rmt_uart_id id);
+
+
 // Nonblocking - xTaskToNotify can be NULL, the caller or anything else.
 // payload must exist until then.
 esp_err_t RU_transmit(rmt_uart_id id, uint8_t* payload, size_t size, TaskHandle_t xTaskToNotify);
 
 bool RU_tx_get_ongoing(const rmt_uart_id id);
 
-
-/* Returns a 1-item queue of rmt_uart_recv_notify_t. Emptiness states being ready to receive.
- * continous: keep receiving. Use xQueuePeek() and CONFIG_RMT_RECV_FUNC_IN_IRAM .
- * defer=-1: Partial recv in ISR, start pushing parts before completion (Not for ESP32).
- * defer=0: Decoding in ISR with partial receiving if available.
- * Other value: Symbol buffer size in bytes for decoding in a task,
- * 5 RMT words (20 bytes) per byte (8N1).
- */
-QueueHandle_t RU_init_rx(rmt_uart_id new_id, rmt_uart_spec_t* conf, int defer, bool continuous);
 
 // Begins receiving and returns the same queue as RU_init_rx.
 QueueHandle_t RU_recv(rmt_uart_id id, uint8_t* buffer, size_t bufferSize);

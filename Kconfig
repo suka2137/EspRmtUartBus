@@ -1,0 +1,15 @@
+menu "RMT-UART"
+    config RU_FLT_MODE
+        int "Filter Mode (0=Dis, 1=HW, 2=SW, 3=Both)"
+        range 0 3
+        default 2
+        help
+            Basic SW logic seems more resilient and predictable than HW for UART signals.
+            Both and Disabled are only meant for testing.
+    config RU_SLOW_EDGE
+        bool "Slow edge compensation (recommended)"
+        default y
+        help
+            Add a non-cumulative rounding value to each run length instead of loosening the basePeriod
+            This can work well when most of the error comes from edge transitions (on by default)
+endmenu

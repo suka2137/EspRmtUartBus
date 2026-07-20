@@ -16,18 +16,21 @@
 #include "esp_attr.h"
 #include "esp_compiler.h"
 #include "esp_err.h"
+#include "esp_check.h"
 
 // #define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #include "esp_log.h"
 
 #include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
+#include "hal/rmt_types.h"
 #include "portmacro.h"
 
 
 #include "rmt-uart.h"
 
-extern bool rmt_uart_ready;
+extern bool ru_regular_uart_initialized;
+extern bool ru_bus_initialized;
 
 typedef struct RMT_UART_DECODER_STATE {
     rmt_uart_rx_result_t lastResult;
@@ -39,18 +42,7 @@ typedef struct RMT_UART_DECODER_STATE {
     size_t outBufSize;
     size_t outBufPos;
 } rmt_uart_decoder_state_t;
-// typedef union {
-//     struct {
-//         uint8_t length0 : 4;
-//         uint8_t length1 : 4;
-//     };
-//     uint8_t val;
-// } rmt_uart_enc_item_t;
-// typedef struct RMT_UART_ENCODER_TABLE_ENTRY {
-//     uint8_t data, stops, parity;
-//     rmt_uart_enc_item_t* parts[4];
-//     uint8_t offs[256];
-// } rmt_uart_enc_lookup_t;
+
 
 typedef struct RMT_UART_TX {
     rmt_uart_spec_t conf;
@@ -63,7 +55,8 @@ typedef struct RMT_UART_TX {
     rmt_encoder_handle_t TxEncoder;
     size_t data_pos;
     uint16_t basePeriod;
-    // rmt_uart_enc_lookup_t* table;
+    bool address_field;
+    uint8_t tx_mpcm_target_addr;
 
     uint8_t notifyIndex;
     TaskHandle_t notifyOnTxDone;
@@ -112,7 +105,6 @@ struct freq_selection {
 };
 struct freq_selection rmt_uart_choose_freq(rmt_uart_spec_t* conf);
 
-// rmt_uart_enc_lookup_t* rmt_uart_gen_enc_table(const rmt_uart_spec_t* conf);
 
 void RMT_UART_begin();
 void RMT_UART_end();

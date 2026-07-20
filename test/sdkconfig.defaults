@@ -1,0 +1,18 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# rmt-uart-ub.h requires the RX decode callback to live in IRAM
+CONFIG_RMT_RECV_FUNC_IN_IRAM=y
+
+# Unity menu busy-waits and starves IDLE -> watchdog reboots. Disable in test builds.
+CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_ESP_TASK_WDT_INIT=n
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Console: this board only exposes USB-Serial/JTAG (no ext UART bridge).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+
+

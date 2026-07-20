@@ -1,1 +1,54 @@
-/home/ja/.clang-format
+---
+BasedOnStyle: chromium
+IndentWidth: 4
+ColumnLimit: 100
+---
+Language: Cpp
+AccessModifierOffset: -2
+AllowShortBlocksOnASingleLine: Always
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: true
+ConstructorInitializerIndentWidth: 0
+BinPackArguments: false
+BreakBeforeBraces: Custom
+BraceWrapping:
+    AfterCaseLabel: true
+    AfterControlStatement: MultiLine
+    BeforeWhile: true
+    SplitEmptyFunction: false
+    SplitEmptyRecord: false
+    SplitEmptyNamespace: false
+PackConstructorInitializers: Never
+IndentGotoLabels: false
+MaxEmptyLinesToKeep: 2
+SpaceBeforeParens: Custom
+SpaceBeforeParensOptions:
+    AfterControlStatements: false
+SpaceBeforeRangeBasedForLoopColon: false
+RemoveBracesLLVM: true
+---
+Language: C
+AccessModifierOffset: -2
+AllowShortBlocksOnASingleLine: Always
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: true
+ConstructorInitializerIndentWidth: 0
+BinPackArguments: false
+BreakBeforeBraces: Custom
+BraceWrapping:
+    AfterCaseLabel: true
+    AfterControlStatement: MultiLine
+    BeforeWhile: true
+    SplitEmptyFunction: false
+    SplitEmptyRecord: false
+    SplitEmptyNamespace: false
+PackConstructorInitializers: Never
+IndentGotoLabels: false
+MaxEmptyLinesToKeep: 2
+SpaceBeforeParens: Custom
+SpaceBeforeParensOptions:
+    AfterControlStatements: false
+SpaceBeforeRangeBasedForLoopColon: false
+RemoveBracesLLVM: true
+...
+

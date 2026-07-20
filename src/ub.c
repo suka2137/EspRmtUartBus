@@ -8,223 +8,91 @@
 #include "esp_vfs.h"
 
 #include "common.h"
+#include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
+#include "portmacro.h"
 #include "rmt-uart-ub.h"
 static const char* TAG = "RMT-UART-UB";
 
-bool rmt_uart_ub_vfs_state = 0;
+bool ru_bus_initialized = false;
 
 typedef struct RMT_UART_DUAL {
     rmt_uart_tx_t tx;
     rmt_uart_rx_t rx;
-    int fd;
+    int id;
+    SemaphoreHandle_t mtx;       // serializes task-context ops (write/read/deinit) vs teardown
+    SemaphoreHandle_t user_mtx;  // external coordination mutex, independent of internal locking
 } rmt_uart_dual_t;
+
 
 static rmt_transmit_config_t TxConf = {.loop_count = 0, .flags.eot_level = 1};
 static rmt_uart_dual_t* duals[4] = {NULL, NULL, NULL, NULL};
 
+// TX-done ISR: flip the shared pin back to input and re-arm RX immediately so the
+// node is listening again the instant the last stop bit drains. rmt_receive() is
+// documented ISR-callable. No critical section: the only shared state touched is
+// tx.active/rx.active (single-word stores, atomic on Xtensa) and the GPIO OE flip
+// (an LL write). The RMT driver owns its own per-channel locking.
 IRAM_ATTR static bool rmt_uart_dual_txDone_callback(rmt_channel_handle_t tx_chan,
                                                     const rmt_tx_done_event_data_t* edata,
                                                     void* user_data) {
     rmt_uart_dual_t* dual = user_data;
+    // Spurious/done-during-init: tx is not busy, leave the line as-is.
     if(unlikely(dual->tx.active == 0)) return false;
 
     GPIO.func_out_sel_cfg[dual->tx.conf.gpio].oen_sel = 1;
     gpio_ll_output_disable(&GPIO, dual->tx.conf.gpio);
     dual->tx.active = 0;
 
-    ESP_ERROR_CHECK(rmt_receive(
-        dual->rx.rmtCh, dual->rx.recv_symbol_buffer, dual->rx.rx_buf_bytes, &dual->rx.RxConf));
-    dual->rx.active = 1;
-    return 0;
-}
-
-
-static int ub_open(const char* path, int flags, int mode) {
-    ///"0.9e1.21.125000"
-
-    int len = strlen(path);
-    char s[25];
-    for(int i = 1; i < len && i < 25; i++) s[i - 1] = toupper(path[i]);
-    s[len - 1] = '\0';
-
-    int id = atoi(strtok(s, "."));
-    if(id < 0 || id > 3) {
-        ESP_LOGE(TAG, "id %d out of range", id);
-        return -1;
-    }
-    rmt_uart_dual_t* dual = duals[id];
-    if(dual != NULL) {
-        if(flags == O_RDWR || flags == O_RDONLY) {
-            if(!dual->rx.active) {
-                ESP_ERROR_CHECK(rmt_receive(dual->rx.rmtCh,
-                                            dual->rx.recv_symbol_buffer,
-                                            dual->rx.rx_buf_bytes,
-                                            &dual->rx.RxConf));
-                dual->rx.active = 1;
-            }
-        }
-        return id;
-    }
-
-    char* tok = strtok(NULL, ".");
-    int bits = tok[0] - '0';
-
-    char* p = strchr(rmt_uart_p_ch, tok[1]);
-    if(p == NULL) {
-        ESP_LOGE(TAG, "parity: dec: %d", id);
-        return -1;
-    }
-    int parity = p - rmt_uart_p_ch;
-
-    int stops = atoi(tok + 2);
-
-    tok = strtok(NULL, ".");
-    uint32_t gpio = atoi(tok);
-
-    tok = strtok(NULL, ".");
-    uint32_t rate = atoi(tok);
-
-    rmt_uart_spec_t conf = {
-        .rate = rate,
-        .gpio = gpio,
-        .data_bits = bits,
-        .parity = parity,
-        .stop_bits = stops,
-    };
-    ESP_ERROR_CHECK(RU_UB_init(id, &conf));
-    dual = duals[id];
-    if(flags == O_RDWR || flags == O_RDONLY) {
-        if(!dual->rx.active) {
-            ESP_ERROR_CHECK(rmt_receive(dual->rx.rmtCh,
-                                        dual->rx.recv_symbol_buffer,
-                                        dual->rx.rx_buf_bytes,
-                                        &dual->rx.RxConf));
-            dual->rx.active = 1;
-        }
-    }
-    return id;
-}
-
-// Clear RX Queue, write, switch back to RX
-ssize_t UB_write(int fd, const void* data, size_t size) {
-    // ESP_LOGD(TAG, "write %zu", size);
-    if(fd < 0 || fd > 3) return -1;
-    rmt_uart_dual_t* dual = duals[fd];
-    assert(dual != NULL && data != NULL);
-    if(!size) return 0;
-
-    rmt_uart_recv_notify_t resp = {0};
-    xQueueReceive(dual->rx.recv_notify_queue, &resp, 0);
-    if(resp.result == RU_RECV_SUCCESS && resp.data != NULL)
-        ESP_LOGW(TAG, "ub_write cleared successful receive data");
-    if(dual->rx.active) {
-        ESP_ERROR_CHECK(rmt_disable(dual->rx.rmtCh));
-        ESP_ERROR_CHECK(rmt_enable(dual->rx.rmtCh));
-        dual->rx.active = 0;
-    }
-    if(!dual->tx.active) {
-        gpio_ll_output_enable(&GPIO, dual->tx.conf.gpio);
-        dual->tx.active = 1;
-    }
-    ESP_ERROR_CHECK(rmt_transmit(dual->tx.rmtCh, dual->tx.TxEncoder, data, size, &TxConf));
-    rmt_tx_wait_all_done(dual->tx.rmtCh, -1);
-    return size;
-}
-// Each read discards anything after size
-// Setting a lower size wont stop the rx
-ssize_t UB_read(int fd, void* dst, size_t size) {
-    // ESP_LOGD(TAG, "read %zu", size);
-    if(fd < 0 || fd > 3) return -1;
-    rmt_uart_dual_t* dual = duals[fd];
-    assert(dual != NULL && dst != NULL);
-    if(!size) return 0;
-    if(size > dual->rx.decoder_state.outBufSize) return -1;
-    rmt_uart_recv_notify_t resp = {0};
-    rmt_uart_recv_notify_t empty = {0};
-    xQueuePeek(dual->rx.recv_notify_queue, &resp, 0);
-    if(resp.result != 0) xQueueReceive(dual->rx.recv_notify_queue, &resp, 0);
-
-    if(dual->tx.active) {
-        GPIO.func_out_sel_cfg[dual->tx.conf.gpio].oen_sel =
-            1;  // Force the output enable signal to be sourced from bit n of GPIO_ENABLE_REG
-        gpio_ll_output_disable(&GPIO, dual->tx.conf.gpio);
-        dual->tx.active = 0;
-    }
-    if(!dual->rx.active) {
-        ESP_ERROR_CHECK(rmt_receive(
-            dual->rx.rmtCh, dual->rx.recv_symbol_buffer, dual->rx.rx_buf_bytes, &dual->rx.RxConf));
+    esp_err_t r = rmt_receive(dual->rx.rmtCh, dual->rx.recv_symbol_buffer,
+                              dual->rx.rx_buf_bytes, &dual->rx.RxConf);
+    if(r == ESP_OK) {
+        dual->rx.active = 1;
+    } else if(r == ESP_ERR_INVALID_STATE) {
+        // RX got disabled (e.g. by a concurrent deinit path); re-enable then re-arm.
+        rmt_enable(dual->rx.rmtCh);
+        rmt_receive(dual->rx.rmtCh, dual->rx.recv_symbol_buffer,
+                    dual->rx.rx_buf_bytes, &dual->rx.RxConf);
         dual->rx.active = 1;
     }
-
-    resp = empty;
-    xQueueReceive(dual->rx.recv_notify_queue, &resp, pdMS_TO_TICKS(100));
-    if(resp.result != RU_RECV_SUCCESS) return -1;
-    if(!resp.size) return 0;
-    assert(resp.data != NULL);
-    size = MIN(size, resp.size);
-    memcpy(dst, resp.data, size);
-    return size;
+    return false;
 }
 
-static const esp_vfs_t vfst = {
-    .write = UB_write,
-    .read = UB_read,
-    .open = ub_open,
-    .close = UB_deinit,
-};
-esp_err_t UB_init_vfs() {
-    ESP_ERROR_CHECK(esp_vfs_register("/dev/ub", &vfst, NULL));
+esp_err_t RU_bus_add_channels(rmt_uart_spec_t* conf) {
+    int id = 0;
+    while(id < 4 && duals[id] != NULL) id++;
+    ESP_RETURN_ON_FALSE(id < 4, ESP_FAIL, TAG, "all ids taken");
+    if(conf->data_bits < 4 || conf->data_bits > 9 || conf->parity < 0 || conf->parity > 4 ||
+       !(conf->stop_bits == RU_STOPS_1 || conf->stop_bits == RU_STOPS_1_5 ||
+         conf->stop_bits == RU_STOPS_2) ||
+       conf->rate > 3200000 || conf->rate == 0)
+        return ESP_ERR_INVALID_ARG;
 
-    rmt_uart_ub_vfs_state = 1;
-
-    return ESP_OK;
-}
-
-
-esp_err_t RU_UB_init(ru_ub_id new_id, rmt_uart_spec_t* conf) {
-    if(!rmt_uart_ready) RMT_UART_begin();
-    assert(new_id >= 0 && new_id < 4);
-    if(duals[new_id] != NULL) {
-        ESP_LOGE(TAG, "%d: id taken", new_id);
-        return -1;
-    }
     ESP_LOGD(TAG,
              "Creating %" PRIu32 " %d%c%d UB, id: %d, GPIO:%" PRIu32 "",
              conf->rate,
              conf->data_bits,
              rmt_uart_p_ch[conf->parity],
              conf->stop_bits,
-             new_id,
+             id,
              conf->gpio);
-    if(conf->data_bits < 4 || conf->data_bits > 9 || conf->parity < 0 || conf->parity > 4 ||
-       !(conf->stop_bits == RU_STOPS_1 || conf->stop_bits == RU_STOPS_1_5 ||
-         conf->stop_bits == RU_STOPS_2) ||
-       conf->rate > 3200000 || conf->rate == 0)
-        return ESP_ERR_INVALID_ARG;
-    duals[new_id] = malloc(sizeof(rmt_uart_dual_t));
-    rmt_uart_dual_t* dual = duals[new_id];
+    duals[id] = malloc(sizeof(rmt_uart_dual_t));
+    rmt_uart_dual_t* dual = duals[id];
     rmt_uart_dual_t empty = {0};
     *dual = empty;
     rmt_uart_tx_t* tx = &dual->tx;
     rmt_uart_rx_t* rx = &dual->rx;
     tx->conf = *conf;
     rx->conf = *conf;
-    tx->selfId = new_id;
-    rx->selfId = new_id;
+    tx->selfId = id;
+    tx->address_field = true;
+    rx->selfId = id;
     rx->reenable_rx = 1;
 
     int mem_blocks = 1;
     rx->rx_buf_bytes = mem_blocks * 256;
     rx->recv_symbol_buffer = malloc(rx->rx_buf_bytes);
 
-    // if(RMT_UART_NO_ENC_TABLE == 0) {
-    //     tx->table = rmt_uart_gen_enc_table(conf);
-    //     if(tx->table == NULL) {
-    //         ESP_LOGE(TAG, "Gen table failed");
-    //         return -1;
-    //     }
-    // }
     struct freq_selection freqs = rmt_uart_choose_freq(conf);
     tx->basePeriod = freqs.basePeriod;
 
@@ -235,14 +103,13 @@ esp_err_t RU_UB_init(ru_ub_id new_id, rmt_uart_spec_t* conf) {
         .resolution_hz = freqs.rmt_resolution_hz,
         .trans_queue_depth = 1,
         .flags.invert_out = false,
-    //.flags.io_loop_back = 0, TODO
-    //.flags.io_od_mode = 0,
 #if !SOC_RMT_SUPPORT_DMA
         .flags.with_dma = 0,
 #else
-        .flags.with_dma = (new_id == 0),
+        .flags.with_dma = (id == 0),
 #endif
-        .flags.allow_pd = 0,
+        .flags.allow_pd = false,
+        .flags.init_level = 1,
     };
     tx->TxChConf = tx_chan_config;
 
@@ -263,9 +130,9 @@ esp_err_t RU_UB_init(ru_ub_id new_id, rmt_uart_spec_t* conf) {
 #if !SOC_RMT_SUPPORT_DMA
         .flags.with_dma = 0,
 #else
-        .flags.with_dma = (new_id == 0),
+        .flags.with_dma = (id == 0),
 #endif
-        .flags.allow_pd = 0,
+        .flags.allow_pd = false,
     };
     rmt_receive_config_t RxConf = {
         .signal_range_max_ns = freqs.idle_range_ns,
@@ -288,7 +155,7 @@ esp_err_t RU_UB_init(ru_ub_id new_id, rmt_uart_spec_t* conf) {
     ds.outBufSize = 1024;
 #endif
     // destination might not be known when it needs to be quickly switched to rx
-    ESP_LOGD(TAG, "%d: intermediary buf: %zuB", new_id, ds.outBufSize);
+    ESP_LOGD(TAG, "%d: intermediary buf: %zuB", id, ds.outBufSize);
     ds.outBuf = malloc(ds.outBufSize);
     rx->decoder_state = ds;
     rx->recv_notify_queue = xQueueCreate(1, sizeof(rmt_uart_recv_notify_t));
@@ -325,44 +192,171 @@ esp_err_t RU_UB_init(ru_ub_id new_id, rmt_uart_spec_t* conf) {
     gpio_pullup_en(conf->gpio);
     gpio_hold_dis(conf->gpio);
 
-    dual->fd = new_id;
+    dual->id = id;
+    dual->mtx = xSemaphoreCreateMutex();
+    dual->user_mtx = xSemaphoreCreateMutex();
+
+    ru_bus_initialized = true;
     return ESP_OK;
 }
 
-int UB_deinit(int fd) {
-    assert(fd >= 0 && fd < 4);
-    rmt_uart_dual_t* dual = duals[fd];
-    if(dual == NULL) return 0;
+// Take the per-dual mutex for the duration of a bus operation. This serializes
+// write/read/deinit against each other and against teardown, so the dual pointer
+// and its queue/buffers stay valid for the whole call without TOCTOU windows.
+static rmt_uart_dual_t* dual_lock(ru_ub_id channel, TickType_t timeout) {
+    if(channel < 0 || channel >= 4) return NULL;
+    rmt_uart_dual_t* dual = duals[channel];
+    if(dual == NULL) return NULL;
+    if(xSemaphoreTake(dual->mtx, timeout) != pdTRUE) return NULL;
+    // Re-check after acquiring: deinit may have torn us down between the NULL check
+    // and the take. duals[] is mutated only under the mutex.
+    if(duals[channel] != dual) {
+        xSemaphoreGive(dual->mtx);
+        return NULL;
+    }
+    return dual;
+}
 
-    dual->tx.active = 0;
+ssize_t RU_bus_write(ru_ub_id channel, uint8_t addr, const void* data, size_t size) {
+    rmt_uart_dual_t* dual = dual_lock(channel, portMAX_DELAY);
+    if(dual == NULL) return -1;
+    if(!size) { xSemaphoreGive(dual->mtx); return 0; }
+
+    // Drain any stale RX result so the ISR has queue space to push the next one.
+    rmt_uart_recv_notify_t resp = {0};
+    xQueueReceive(dual->rx.recv_notify_queue, &resp, 0);
+    if(resp.result == RU_RECV_SUCCESS && resp.data != NULL)
+        ESP_LOGW(TAG, "RU_bus_write cleared successful receive data");
+
+    if(dual->rx.active) {
+        // Restart RX cleanly so a partial buffer doesn't confuse the decoder.
+        ESP_ERROR_CHECK(rmt_disable(dual->rx.rmtCh));
+        ESP_ERROR_CHECK(rmt_enable(dual->rx.rmtCh));
+        dual->rx.active = 0;
+    }
+    // Enable output and mark busy; the TX-done ISR will flip both back.
+    GPIO.func_out_sel_cfg[dual->tx.conf.gpio].oen_sel = 1;
+    gpio_ll_output_enable(&GPIO, dual->tx.conf.gpio);
+    dual->tx.active = 1;
+
+    dual->tx.tx_mpcm_target_addr = addr;
+    ESP_ERROR_CHECK(rmt_transmit(dual->tx.rmtCh, dual->tx.TxEncoder, data, size, &TxConf));
+    // Wait for the frame to finish so the ISR has re-armed RX by the time we return.
     rmt_tx_wait_all_done(dual->tx.rmtCh, -1);
-    gpio_hold_en(dual->tx.conf.gpio);
-    rmt_disable(dual->tx.rmtCh);
+    xSemaphoreGive(dual->mtx);
+    return size;
+}
 
-    dual->rx.reenable_rx = 0;
-    dual->rx.active = 0;
-    rmt_rx_event_callbacks_t cbs = {.on_recv_done = NULL};
-    rmt_rx_register_event_callbacks(dual->rx.rmtCh, &cbs, NULL);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    rmt_disable(dual->rx.rmtCh);
-    free(dual->rx.decoder_state.outBuf);
+ssize_t RU_bus_read(ru_ub_id channel, void* dst, size_t size) {
+    rmt_uart_dual_t* dual = dual_lock(channel, portMAX_DELAY);
+    if(dual == NULL) return -1;
+    if(size > dual->rx.decoder_state.outBufSize) { xSemaphoreGive(dual->mtx); return -1; }
+    if(!size) { xSemaphoreGive(dual->mtx); return 0; }
+    if(dual->tx.active) {
+        ESP_LOGE(TAG, "%d: read while tx still active", channel);
+        xSemaphoreGive(dual->mtx);
+        return -1;
+    }
 
-    rmt_del_channel(dual->tx.rmtCh);
-    rmt_del_channel(dual->rx.rmtCh);
-    rmt_del_encoder(dual->tx.TxEncoder);
-    gpio_reset_pin(dual->tx.conf.gpio);
-    gpio_hold_dis(dual->tx.conf.gpio);
+    // Drop any already-completed result from the queue so we block for a fresh one.
+    rmt_uart_recv_notify_t resp = {0};
+    xQueuePeek(dual->rx.recv_notify_queue, &resp, 0);
+    if(resp.result != 0) xQueueReceive(dual->rx.recv_notify_queue, &resp, 0);
 
-    vQueueDelete(dual->rx.recv_notify_queue);
-    free(dual->rx.recv_symbol_buffer);
-    free(dual);
-    duals[fd] = NULL;
-    return 0;
+    if(!dual->rx.active) {
+        ESP_ERROR_CHECK(rmt_receive(dual->rx.rmtCh, dual->rx.recv_symbol_buffer,
+                                    dual->rx.rx_buf_bytes, &dual->rx.RxConf));
+        dual->rx.active = 1;
+    }
+
+    // Block for a completed frame. The RX decode ISR fills the queue; during the
+    // wait the mutex is released so other channels (or this channel's writer) can
+    // proceed. We drop the lock across the blocking receive to avoid deadlocking
+    // a higher-priority task that needs this channel.
+    // NOTE: the RX path owns decoder_state/queue/buffer for the channel's lifetime,
+    //       so the brief unlock is safe.
+    xSemaphoreGive(dual->mtx);
+    resp = (rmt_uart_recv_notify_t){0};
+    if(xQueueReceive(dual->rx.recv_notify_queue, &resp, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGE(TAG, "%d: receive timeout", channel);
+        return -1;
+    }
+    if(resp.result != RU_RECV_SUCCESS) {
+        ESP_LOGE(TAG, "%d: Receive error %d", channel, resp.result);
+        return -1;
+    }
+    if(!resp.size) return 0;
+    assert(resp.data != NULL);
+    size = MIN(size, resp.size);
+    memcpy(dst, resp.data, size);
+    return size;
+}
+
+void RU_bus_get_mutex(ru_ub_id channel, TickType_t timeout) {
+    assert(channel >= 0 && channel < 4);
+    rmt_uart_dual_t* dual = duals[channel];
+    assert(dual != NULL);
+    xSemaphoreTake(dual->user_mtx, timeout);
+}
+void RU_bus_release_mutex(ru_ub_id channel) {
+    assert(channel >= 0 && channel < 4);
+    rmt_uart_dual_t* dual = duals[channel];
+    assert(dual != NULL);
+    xSemaphoreGive(dual->user_mtx);
 }
 
 
-void RMT_UART_UB_end() {
+static void UB_deinit(int id) {
+    assert(id >= 0 && id < 4);
+    rmt_uart_dual_t* dual = duals[id];
+    if(dual == NULL) return;
+
+    // Serialize against any in-flight write/read on this channel. portMAX_DELAY
+    // because teardown must not be denied by a stuck peer.
+    xSemaphoreTake(dual->mtx, portMAX_DELAY);
+
+    // Also block external users from holding resources we're about to free.
+    xSemaphoreTake(dual->user_mtx, portMAX_DELAY);
+
+    // Quiesce hardware first. rmt_disable is synchronous: it stops the channel and
+    // drains any pending interrupt, so once these return no TX-done / RX-done ISR
+    // will fire on this core or the other. Unregistering callbacks afterward is
+    // then race-free.
+    rmt_tx_wait_all_done(dual->tx.rmtCh, -1);
+    rmt_disable(dual->tx.rmtCh);
+    rmt_disable(dual->rx.rmtCh);
+
+    rmt_tx_event_callbacks_t tx_null = {.on_trans_done = NULL};
+    rmt_rx_event_callbacks_t rx_null = {.on_recv_done = NULL};
+    rmt_tx_register_event_callbacks(dual->tx.rmtCh, &tx_null, NULL);
+    rmt_rx_register_event_callbacks(dual->rx.rmtCh, &rx_null, NULL);
+
+    gpio_hold_en(dual->tx.conf.gpio);
+    ESP_ERROR_CHECK(rmt_del_channel(dual->tx.rmtCh));
+    ESP_ERROR_CHECK(rmt_del_channel(dual->rx.rmtCh));
+    ESP_ERROR_CHECK(rmt_del_encoder(dual->tx.TxEncoder));
+    gpio_reset_pin(dual->tx.conf.gpio);
+    gpio_hold_dis(dual->tx.conf.gpio);
+
+    // Now that the hardware is gone and ISRs quiesced, the queue/buffers are
+    // exclusively ours. Null the handle last so any stale ISR context bails out.
+    dual->tx.rmtCh = NULL;
+    dual->rx.rmtCh = NULL;
+    vQueueDelete(dual->rx.recv_notify_queue);
+    free(dual->rx.recv_symbol_buffer);
+    free(dual->rx.decoder_state.outBuf);
+
+    duals[id] = NULL;
+    xSemaphoreGive(dual->user_mtx);
+    vSemaphoreDelete(dual->user_mtx);
+    xSemaphoreGive(dual->mtx);
+    vSemaphoreDelete(dual->mtx);
+    free(dual);
+}
+
+
+void RU_bus_deinit() {
     for(int i = 0; i < 4; i++)
         if(duals[i] != NULL) UB_deinit(i);
-    if(rmt_uart_ub_vfs_state) esp_vfs_unregister("/dev/ub");
+    ru_bus_initialized = false;
 }
