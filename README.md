@@ -9,11 +9,11 @@
 
 
 
-|Supported SoC|Framework|RMTs|Receive notes|RMT Sleep Retention|
+|SoC|Framework|RMTs|Receive notes|RMT Sleep Retention|
 |---|---|---|---|---|
 |ESP32-S3|ESP-IDF 6|4 TX + 4 RX| |Unsupported by HW|
-|ESP32|ESP-IDF 6|8 TX/RX|**No RX thres int - limited to 12B / RMT Mem Block**|Unsupported by HW|
-|ESP32-C3|ESP-IDF 6|2 TX + 2 RX| |Unsupported by HW|
+|ESP32|not tested|8 TX/RX|**No RX thres int - limited to 12B / RMT Mem Block**|Unsupported by HW|
+|ESP32-C3|not tested|2 TX + 2 RX| |Unsupported by HW|
 
 It should also be possible to run in arduino.
 
